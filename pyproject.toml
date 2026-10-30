@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "colabgame"
+version = "0.1.0"
+description = "Google Colab で pygame / pyxel / turtle のゲームをリアルタイムに動かすライブラリ"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dependencies = []
+
+[project.optional-dependencies]
+pygame = ["pygbag"]
+pyxel = ["pyxel"]
+all = ["pygbag", "pyxel"]
+
+[tool.setuptools]
+packages = ["colabgame", "colabgame.backends"]
+
+[tool.setuptools.package-data]
+colabgame = ["runtime/turtle/*"]

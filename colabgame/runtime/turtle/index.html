@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Python Turtle Graphics</title>
+<style>
+  :root { --bg:#eef0f2; --fg:#1f2328; --muted:#6a737d; --panel:#ffffff; --line:#d0d7de; --err:#b42318; --focus:#2f6fde; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#202225; --fg:#e6e6e6; --muted:#9aa0a6; --panel:#2b2d31; --line:#3c3f44; --err:#ff8a80; --focus:#7aa7ff; color-scheme:dark; }
+  }
+  html, body { margin:0; background:var(--bg); color:var(--fg); font:13px/1.5 system-ui, -apple-system, "Hiragino Sans", "Noto Sans JP", sans-serif; }
+  #wrap { display:flex; flex-direction:column; align-items:center; gap:6px; padding:8px; }
+  #bar { width:100%; max-width:var(--cw, 600px); display:flex; justify-content:space-between; gap:12px; color:var(--muted); }
+  #title { color:var(--fg); font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  canvas { display:block; max-width:100%; height:auto; border:1px solid var(--line); outline:none; touch-action:none; }
+  canvas:focus-visible { border-color:var(--focus); box-shadow:0 0 0 2px var(--focus); }
+  #out { box-sizing:border-box; width:100%; max-width:var(--cw, 600px); max-height:160px; overflow:auto; margin:0; padding:6px 8px;
+         background:var(--panel); border:1px solid var(--line); white-space:pre-wrap; font:12px/1.45 ui-monospace, Menlo, Consolas, monospace; }
+  #out:empty { display:none; }
+  #out .err { color:var(--err); }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="bar"><span id="title">Python Turtle Graphics</span><span id="status">Python を読み込み中…</span></div>
+  <canvas id="cv" width="600" height="600" tabindex="0" aria-label="タートルの描画エリア（クリックするとキー操作が有効になります）"></canvas>
+  <pre id="out" aria-live="polite"></pre>
+</div>
+<script src="https://cdn.jsdelivr.net/pyodide/v0.26.4/full/pyodide.js"></script>
+<script>
+"use strict";
+const cv = document.getElementById("cv"), ctx = cv.getContext("2d");
+const pen = document.createElement("canvas"), pctx = pen.getContext("2d");
+const outEl = document.getElementById("out"), statusEl = document.getElementById("status"), titleEl = document.getElementById("title");
+let W = 600, H = 600, bg = "white", bgImg = null, world = null, closed = false, dispatcher = null, penDirty = true;
+let queue = [], items = [], frameWaiters = [];
+const turtles = new Map(), shapes = {}, images = {};
+
+function setStatus(t) { statusEl.textContent = t; }
+function print(text, isErr) {
+  const span = document.createElement("span");
+  if (isErr) span.className = "err";
+  span.textContent = text;
+  outEl.appendChild(span);
+  outEl.scrollTop = outEl.scrollHeight;
+}
+function resize(w, h) {
+  W = cv.width = pen.width = Math.max(1, w | 0);
+  H = cv.height = pen.height = Math.max(1, h | 0);
+  document.documentElement.style.setProperty("--cw", W + "px");
+  penDirty = true;
+}
+function loadImg(src) {
+  if (!images[src]) { const im = new Image(); im.src = src; images[src] = im; }
+  return images[src];
+}
+function toC(x, y) {
+  if (world) return [(x - world.llx) / (world.urx - world.llx) * W, H - (y - world.lly) / (world.ury - world.lly) * H];
+  return [W / 2 + x, H / 2 - y];
+}
+function fromC(cx, cy) {
+  if (world) return [world.llx + cx / W * (world.urx - world.llx), world.lly + (H - cy) / H * (world.ury - world.lly)];
+  return [cx - W / 2, H / 2 - cy];
+}
+
+// ---- Python から呼ばれる関数 ----
+window.cgPush = (s) => { queue.push(JSON.parse(s)); };
+window.cgSetDispatcher = (f) => { dispatcher = f; };
+window.cgError = (t) => { print(cleanTrace(String(t)) + "\n", true); };
+window.cgTimer = (id, ms) => { setTimeout(() => send("timer", id), ms); };
+window.cgFrame = () => new Promise((r) => frameWaiters.push(r));
+window.cgMeasure = (t, font) => { ctx.save(); ctx.font = font; const w = ctx.measureText(t).width; ctx.restore(); return w; };
+
+function send(kind, a, b, c) {
+  if (!dispatcher || closed) return;
+  try { dispatcher(kind, a, b, c); } catch (e) { print(String(e) + "\n", true); }
+}
+function cleanTrace(t) {
+  const lines = t.split("\n");
+  const i = lines.findIndex((l) => l.includes('File "<exec>"'));
+  return i > 0 ? "Traceback (most recent call last):\n" + lines.slice(i).join("\n") : t;
+}
+
+// ---- 描画 ----
+function drawShape(c, x, y, s) {
+  const sh = shapes[s.shape];
+  if (!sh) return;
+  const [cx, cy] = toC(x, y);
+  if (sh.type === "image") {
+    const im = loadImg(sh.src);
+    if (im.complete && im.naturalWidth) c.drawImage(im, cx - im.naturalWidth / 2, cy - im.naturalHeight / 2);
+    return;
+  }
+  const pts = sh.pts;
+  if (!pts.length) return;
+  const a = (s.h + s.tilt - 90) * Math.PI / 180, co = Math.cos(a), si = Math.sin(a);
+  c.beginPath();
+  pts.forEach(([px, py], i) => {
+    const sx = px * s.sw, sy = py * s.sl;
+    const dx = sx * co - sy * si, dy = sx * si + sy * co;
+    i ? c.lineTo(cx + dx, cy - dy) : c.moveTo(cx + dx, cy - dy);
+  });
+  c.closePath();
+  c.fillStyle = s.fc; c.fill();
+  c.lineWidth = s.ol; c.strokeStyle = s.pc; c.lineJoin = "round"; c.stroke();
+}
+function drawLine(c, x1, y1, x2, y2, w, col) {
+  const [a, b] = toC(x1, y1), [d, e] = toC(x2, y2);
+  c.beginPath(); c.moveTo(a, b); c.lineTo(d, e);
+  c.lineWidth = w; c.strokeStyle = col; c.lineCap = "round"; c.lineJoin = "round"; c.stroke();
+}
+function drawItem(c, it) {
+  switch (it.k) {
+    case "line": drawLine(c, it.x1, it.y1, it.x2, it.y2, it.w, it.c); break;
+    case "dot": { const [x, y] = toC(it.x, it.y); c.beginPath(); c.arc(x, y, it.r / 2, 0, Math.PI * 2); c.fillStyle = it.c; c.fill(); break; }
+    case "text": { const [x, y] = toC(it.x, it.y); c.font = it.font; c.fillStyle = it.c; c.textAlign = it.align; c.textBaseline = "bottom"; c.fillText(it.t, x, y); break; }
+    case "stamp": drawShape(c, it.x, it.y, it.s); break;
+    case "fill": if (it.pts) {
+      c.beginPath();
+      for (let i = 0; i < it.pts.length; i += 2) { const [x, y] = toC(it.pts[i], it.pts[i + 1]); i ? c.lineTo(x, y) : c.moveTo(x, y); }
+      c.closePath(); c.fillStyle = it.c; c.fill();
+    } break;
+  }
+}
+function addItem(it) { items.push(it); if (!penDirty) drawItem(pctx, it); }
+function redrawPen() { pctx.clearRect(0, 0, W, H); items.forEach((it) => drawItem(pctx, it)); penDirty = false; }
+
+function apply(ev) {
+  const t = ev.id !== undefined ? turtles.get(ev.id) : null;
+  switch (ev.op) {
+    case "setup": resize(ev.w, ev.h); break;
+    case "bg": bg = ev.c; break;
+    case "bgpic": bgImg = ev.src ? loadImg(ev.src) : null; break;
+    case "title": titleEl.textContent = document.title = ev.t; break;
+    case "world": world = ev.w; penDirty = true; break;
+    case "shape": shapes[ev.name] = ev.def; if (ev.def.type === "image") loadImg(ev.def.src); break;
+    case "new": turtles.set(ev.id, Object.assign({ x: 0, y: 0 }, ev.s)); break;
+    case "state": if (t) Object.assign(t, ev.s); break;
+    case "move":
+      if (!t) break;
+      if (ev.line) addItem({ k: "line", o: ev.id, x1: t.x, y1: t.y, x2: ev.x, y2: ev.y, w: ev.line[0], c: ev.line[1] });
+      t.x = ev.x; t.y = ev.y; Object.assign(t, ev.s); break;
+    case "dot": addItem({ k: "dot", o: ev.id, x: ev.x, y: ev.y, r: ev.r, c: ev.c }); break;
+    case "text": addItem({ k: "text", o: ev.id, x: ev.x, y: ev.y, t: ev.t, align: ev.align, font: ev.font, c: ev.c }); break;
+    case "stamp": if (t) addItem({ k: "stamp", o: ev.id, sid: ev.sid, x: t.x, y: t.y, s: Object.assign({}, t, ev.s) }); break;
+    case "clearstamp": items = items.filter((i) => !(i.k === "stamp" && ev.sids.includes(i.sid))); penDirty = true; break;
+    case "beginfill": items.push({ k: "fill", o: ev.id, fid: ev.fid, pts: null }); break;
+    case "fill": { const it = items.find((i) => i.k === "fill" && i.fid === ev.fid); if (it) { it.pts = ev.pts; it.c = ev.c; } penDirty = true; break; }
+    case "clear": items = items.filter((i) => i.o !== ev.id); penDirty = true; break;
+    case "clearscreen": items = []; turtles.clear(); bg = "white"; bgImg = null; world = null; penDirty = true; break;
+    case "bye": closed = true; setStatus("終了しました"); break;
+  }
+}
+
+function render(anim) {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.fillStyle = bg; ctx.fillRect(0, 0, W, H);
+  if (bgImg && bgImg.complete && bgImg.naturalWidth) ctx.drawImage(bgImg, (W - bgImg.naturalWidth) / 2, (H - bgImg.naturalHeight) / 2);
+  ctx.drawImage(pen, 0, 0);
+  let ax, ay;
+  if (anim) {
+    const e = anim.ev, p = 1 - e.left / e.total;
+    ax = e.sx + (e.x - e.sx) * p; ay = e.sy + (e.y - e.sy) * p;
+    if (e.line) drawLine(ctx, e.sx, e.sy, ax, ay, e.line[0], e.line[1]);
+  }
+  for (const [id, t] of turtles) {
+    const s = anim && anim.ev.id === id ? Object.assign({}, t, anim.ev.s) : t;
+    if (!s.vis) continue;
+    if (anim && anim.ev.id === id) drawShape(ctx, ax, ay, s); else drawShape(ctx, t.x, t.y, s);
+  }
+}
+
+function pxPerFrame(spd) { return 2 + spd * spd * 0.45; }
+function tick() {
+  let budget = 1, n = 0, anim = null;
+  while (queue.length && n < 50000) {
+    const ev = queue[0];
+    if (ev.op === "move" && ev.spd > 0 && turtles.has(ev.id)) {
+      const t = turtles.get(ev.id);
+      if (ev.left === undefined) {
+        const [a, b] = toC(t.x, t.y), [c, d] = toC(ev.x, ev.y);
+        ev.sx = t.x; ev.sy = t.y;
+        ev.total = ev.left = Math.hypot(c - a, d - b) / pxPerFrame(ev.spd);
+      }
+      const use = Math.min(budget, ev.left);
+      ev.left -= use; budget -= use;
+      if (ev.left > 1e-6) { anim = { ev }; break; }
+    }
+    apply(ev); queue.shift(); n++;
+  }
+  if (penDirty) redrawPen();
+  render(anim);
+  if (!queue.length && frameWaiters.length) { const w = frameWaiters; frameWaiters = []; w.forEach((r) => r()); }
+  requestAnimationFrame(tick);
+}
+
+// ---- 入力 ----
+const KEYS = { ArrowUp: "Up", ArrowDown: "Down", ArrowLeft: "Left", ArrowRight: "Right", " ": "space", Enter: "Return",
+  Escape: "Escape", Backspace: "BackSpace", Tab: "Tab", Shift: "Shift_L", Control: "Control_L", Alt: "Alt_L", Delete: "Delete" };
+const BLOCK = new Set(["Up", "Down", "Left", "Right", "space", "Tab", "BackSpace"]);
+function keyName(e) { return KEYS[e.key] || e.key; }
+window.addEventListener("keydown", (e) => { const k = keyName(e); if (BLOCK.has(k)) e.preventDefault(); send("keydown", k); });
+window.addEventListener("keyup", (e) => { const k = keyName(e); if (BLOCK.has(k)) e.preventDefault(); send("keyup", k); });
+function pos(e) { const r = cv.getBoundingClientRect(); return fromC((e.clientX - r.left) * W / r.width, (e.clientY - r.top) * H / r.height); }
+let pressed = false;
+cv.addEventListener("pointerdown", (e) => {
+  cv.focus(); pressed = true; cv.setPointerCapture(e.pointerId);
+  const [x, y] = pos(e); send("down", e.button + 1, x, y); send("click", e.button + 1, x, y);
+});
+cv.addEventListener("pointermove", (e) => { if (pressed) { const [x, y] = pos(e); send("move", 0, x, y); } });
+cv.addEventListener("pointerup", (e) => { pressed = false; const [x, y] = pos(e); send("up", e.button + 1, x, y); });
+cv.addEventListener("contextmenu", (e) => e.preventDefault());
+
+// ---- 起動 ----
+async function main() {
+  requestAnimationFrame(tick);
+  try {
+    const py = await loadPyodide();
+    py.setStdout({ batched: (s) => print(s + "\n") });
+    py.setStderr({ batched: (s) => print(s + "\n", true) });
+    const [shim, code] = await Promise.all(["turtle_shim.py", "main.py"].map((f) => fetch(f).then((r) => r.text())));
+    py.FS.mkdirTree("/cglib");
+    py.FS.writeFile("/cglib/turtle.py", shim);
+    py.runPython("import sys\nsys.path.insert(0, '/cglib')\nsys.modules.pop('turtle', None)\nimport turtle\n" +
+                 "import json, js\nfor k, v in turtle.Screen()._shapes.items(): js.window.cgPush(json.dumps({'op':'shape','name':k,'def':v}))");
+    setStatus("実行中（クリックでキー操作が有効）");
+    cv.focus();
+    const g = py.globals.get("dict")();
+    g.set("__name__", "__main__");
+    await py.runPythonAsync(code, { globals: g });
+    if (!closed) setStatus("実行完了（入力は引き続き受け付けます）");
+  } catch (e) {
+    const m = String(e && e.message || e);
+    if (m.includes("Terminator")) { setStatus("終了しました"); return; }
+    print(cleanTrace(m) + "\n", true);
+    setStatus("エラーが発生しました");
+  }
+}
+main();
+</script>
+</body>
+</html>
